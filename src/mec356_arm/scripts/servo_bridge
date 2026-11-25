@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""Translate position trajectories to two timed USB serial servo targets."""
+import math
+import time
+from collections import deque
+
+import rclpy
+from rclpy.node import Node
+import serial
+from trajectory_msgs.msg import JointTrajectory
+
+JOINTS = ('joint1', 'joint2', 'joint3', 'joint4')
+
+
+def encode_segments(message):
+    names = message.joint_names
+    if len(names) != 4 or set(names) != set(JOINTS) or not message.points:
+        raise ValueError('Expected four distinct arm joints and at least one point')
+    if message.header.stamp.sec or message.header.stamp.nanosec:
+        raise ValueError('Set the trajectory header stamp to zero for immediate execution')
+    previous = 0
+    segments = deque()
+    for index, point in enumerate(message.points):
+        end = point.time_from_start.sec * 1000 + round(point.time_from_start.nanosec / 1e6)
+        duration = end - previous
+        if (duration < 0 or (index and duration == 0) or duration > 60000
+                or len(point.positions) != 4
+                or any(not math.isfinite(angle) for angle in point.positions)):
+            raise ValueError('Invalid trajectory point')
+        angles = [
+            round(90 + math.degrees(max(-1.2, min(1.2, point.positions[names.index(name)]))))
+            for name in JOINTS[:2]
+        ]
+        segments.append((previous / 1000, f'{angles[0]},{angles[1]},{duration}\n'.encode('ascii')))
+        previous = end
+    return segments
+
+
+class ServoBridge(Node):
+    def __init__(self):
+        super().__init__('servo_bridge')
+        self.declare_parameter('port', '/dev/ttyUSB0')
+        self.port = None
+        self.feedback = bytearray()
+        self.discard_feedback = False
+        self.ready_at = 0.0
+        self.retry_at = 0.0
+        self.started = 0.0
+        self.segments = deque()
+        self.create_subscription(
+            JointTrajectory, '/arm_controller/joint_trajectory', self.receive, 10)
+        self.create_timer(0.01, self.tick)
+
+    def receive(self, message):
+        now = time.monotonic()
+        if self.port is None or now < self.ready_at:
+            self.get_logger().warning('Serial port is warming up or disconnected. Resend the pose.')
+            return
+        try:
+            self.segments = encode_segments(message)
+        except ValueError as error:
+            self.get_logger().warning(str(error))
+            return
+        self.started = now
+        self.tick()
+
+    def tick(self):
+        now = time.monotonic()
+        if self.port is None:
+            if now < self.retry_at:
+                return
+            self.retry_at = now + 2
+            try:
+                self.port = serial.Serial(
+                    self.get_parameter('port').value, 115200, timeout=0, write_timeout=0.05)
+            except serial.SerialException as error:
+                self.get_logger().warning(str(error))
+                return
+            self.ready_at = now + 2.5
+            self.get_logger().info('Serial connected. Allow 2.5 seconds for the board to reset.')
+            return
+
+        try:
+            self.read_feedback()
+        except serial.SerialException as error:
+            self.get_logger().error(str(error))
+            self.close()
+            return
+
+        while self.segments and now >= self.started + self.segments[0][0]:
+            _, packet = self.segments.popleft()
+            try:
+                self.port.write(packet)
+            except serial.SerialException as error:
+                self.get_logger().error(str(error))
+                self.close()
+                return
+
+    def read_feedback(self):
+        for byte in self.port.read(min(self.port.in_waiting, 256)):
+            if byte == 10:
+                if not self.discard_feedback and self.feedback.startswith(b'ESP32 '):
+                    self.get_logger().info(self.feedback.decode('ascii', errors='replace').rstrip())
+                self.feedback.clear()
+                self.discard_feedback = False
+            elif not self.discard_feedback:
+                if len(self.feedback) < 160:
+                    self.feedback.append(byte)
+                else:
+                    self.discard_feedback = True
+
+    def close(self):
+        self.segments.clear()
+        self.feedback.clear()
+        self.discard_feedback = False
+        if self.port is not None:
+            self.port.close()
+            self.port = None
+
+
+def main():
+    rclpy.init()
+    bridge = ServoBridge()
+    try:
+        rclpy.spin(bridge)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        bridge.close()
+        bridge.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

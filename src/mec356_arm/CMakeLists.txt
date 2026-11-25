@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.8)
+project(mec356_arm)
+find_package(ament_cmake REQUIRED)
+install(DIRECTORY urdf config launch worlds DESTINATION share/${PROJECT_NAME})
+install(PROGRAMS scripts/send_pose scripts/servo_bridge DESTINATION lib/${PROJECT_NAME})
+ament_package()

@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Publish a manual four-joint target."""
+import argparse
+import math
+import time
+
+import rclpy
+from rclpy.duration import Duration
+from rclpy.utilities import remove_ros_args
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+TOPIC = '/arm_controller/joint_trajectory'
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('angles', nargs=4, type=float, metavar='RAD')
+    parser.add_argument('--seconds', type=float, default=2.0)
+    parser.add_argument('--subscribers', type=int, default=1,
+                        help='minimum matched subscribers (use 2 with the servo bridge)')
+    args = parser.parse_args(remove_ros_args()[1:])
+    if any(not math.isfinite(a) or abs(a) > 1.2 for a in args.angles):
+        parser.error('joint targets must be finite and within +/-1.2 rad')
+    if not 1.25 <= args.seconds <= 30:
+        parser.error('duration must be between 1.25 and 30 seconds')
+    if args.subscribers < 1:
+        parser.error('at least one subscriber is required')
+    rclpy.init()
+    node = rclpy.create_node('manual_arm_pose')
+    try:
+        pub = node.create_publisher(JointTrajectory, TOPIC, 10)
+        deadline = time.monotonic() + 8
+        stable_since = None
+        matched = 0
+        while time.monotonic() < deadline:
+            current = pub.get_subscription_count()
+            now = time.monotonic()
+            if current < args.subscribers:
+                stable_since = None
+            elif stable_since is None or current != matched:
+                stable_since = now
+            elif now - stable_since >= 0.75:
+                break
+            matched = current
+            rclpy.spin_once(node, timeout_sec=0.05)
+        else:
+            raise SystemExit(f'Expected {args.subscribers} trajectory subscribers, matched {matched}')
+        point = JointTrajectoryPoint(positions=args.angles)
+        point.time_from_start.sec, point.time_from_start.nanosec = divmod(
+            round(args.seconds * 1e9), 10**9)
+        pub.publish(JointTrajectory(
+            joint_names=['joint1', 'joint2', 'joint3', 'joint4'], points=[point]))
+        if hasattr(pub, 'wait_for_all_acked'):
+            if not pub.wait_for_all_acked(Duration(seconds=2)):
+                raise SystemExit('Timed out waiting for DDS acknowledgement')
+        else:
+            time.sleep(0.5)
+        print(f'Published {args.angles} to {matched} matched subscribers')
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

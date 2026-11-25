@@ -1,0 +1,109 @@
+name: Lab 2 verification
+on: [push, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  ros:
+    runs-on: ubuntu-24.04
+    container: ros:jazzy-ros-base
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies and build
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y python3-colcon-common-extensions python3-rosdep ros-jazzy-ros2controlcli
+          test -f /etc/ros/rosdep/sources.list.d/20-default.list || rosdep init
+          rosdep update --rosdistro jazzy
+          rosdep install --from-paths src --ignore-src -y --rosdistro jazzy
+          colcon build --event-handlers console_direct+
+      - name: Verify Gazebo motion, TF and ROS-to-serial output
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          source install/setup.bash
+          gz sdf -p src/mec356_arm/urdf/arm.urdf > /tmp/arm.sdf
+          grep -q 'base_anchor' /tmp/arm.sdf
+          python3 - <<'PY'
+          import os, pty, select, signal, subprocess, time
+          import rclpy
+          from sensor_msgs.msg import JointState
+          from tf2_msgs.msg import TFMessage
+
+          master, slave = pty.openpty()
+          log = open('/tmp/lab2.log', 'w')
+          launch = subprocess.Popen([
+              'ros2', 'launch', 'mec356_arm', 'lab.launch.py', 'headless:=true',
+              'hardware:=true', 'port:=' + os.ttyname(slave)],
+              stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+          os.close(slave)
+          rclpy.init()
+          node = rclpy.create_node('lab2_smoke')
+          joints = {}
+          frames = set()
+          node.create_subscription(JointState, '/joint_states',
+              lambda msg: joints.update(zip(msg.name, msg.position)), 10)
+          node.create_subscription(TFMessage, '/tf',
+              lambda msg: frames.update((tf.header.frame_id, tf.child_frame_id)
+                                       for tf in msg.transforms), 10)
+          ids = ['joint1', 'joint2', 'joint3', 'joint4']
+          chain = {('base_link', 'L1'), ('L1', 'L2'), ('L2', 'L3'), ('L3', 'end_effector')}
+
+          def spin_until(check, seconds, label):
+              end = time.monotonic() + seconds
+              while not check():
+                  assert launch.poll() is None, 'Launch exited early'
+                  assert time.monotonic() < end, (label, joints, frames)
+                  rclpy.spin_once(node, timeout_sec=0.1)
+
+          def command(angles, expected):
+              subprocess.run(['ros2', 'run', 'mec356_arm', 'send_pose',
+                              *map(str, angles), '--seconds', '2'], check=True, timeout=15)
+              packet = b''
+              deadline = time.monotonic() + 5
+              while bytes([10]) not in packet and time.monotonic() < deadline:
+                  if select.select([master], [], [], 0.1)[0]:
+                      packet += os.read(master, 1024)
+              assert packet == expected.encode() + bytes([10]), packet
+              spin_until(lambda: all(abs(joints.get(j, 10) - a) < .035
+                                     for j, a in zip(ids, angles)), 15, 'Gazebo pose')
+              print(f'Passed: {angles}, serial {expected}, Gazebo {joints}', flush=True)
+
+          try:
+              spin_until(lambda: all(j in joints for j in ids) and chain <= frames, 80, 'TF chain')
+              controllers = subprocess.check_output(['ros2', 'control', 'list_controllers'],
+                                                    timeout=15, text=True)
+              for name in ('joint_state_broadcaster', 'arm_controller'):
+                  assert any(name in line and line.split()[-1] == 'active'
+                             for line in controllers.splitlines()), controllers
+              time.sleep(3)
+              command([0.55, 0.40, 0.25, -0.20], '122,113,2000')
+              command([-0.35, 0.25, 0.10, 0.15], '70,104,2000')
+              command([0.0, 0.0, 0.0, 0.0], '90,90,2000')
+          finally:
+              os.killpg(launch.pid, signal.SIGINT)
+              try:
+                  launch.wait(timeout=10)
+              except subprocess.TimeoutExpired:
+                  os.killpg(launch.pid, signal.SIGKILL)
+              log.close()
+              print(open('/tmp/lab2.log').read())
+              os.close(master)
+              node.destroy_node()
+              rclpy.shutdown()
+          PY
+  firmware:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Compile Arduino Nano firmware
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install arduino:avr
+          arduino-cli lib install Servo
+          arduino-cli compile --fqbn arduino:avr:nano firmware/arm_servos

@@ -1,0 +1,210 @@
+name: Lab 2 graphical verification
+on: [push, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  ros:
+    runs-on: ubuntu-24.04
+    container: ros:jazzy-ros-base
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install dependencies and build
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y python3-colcon-common-extensions python3-rosdep ros-jazzy-ros2controlcli python3-tk xvfb xauth x11-utils libgl1-mesa-dri ffmpeg xdotool
+          test -f /etc/ros/rosdep/sources.list.d/20-default.list || rosdep init
+          rosdep update --rosdistro jazzy
+          rosdep install --from-paths src --ignore-src -y --rosdistro jazzy
+          colcon build --event-handlers console_direct+
+      - name: Verify Gazebo motion, TF and ROS-to-serial output
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          source install/setup.bash
+          gz sdf -p src/mec356_arm/urdf/arm.urdf > /tmp/arm.sdf
+          grep -q 'base_anchor' /tmp/arm.sdf
+          xvfb-run -a -s "-screen 0 1920x900x24" python3 - <<'PY'
+          import os, pty, select, signal, subprocess, time
+          from pathlib import Path
+          import rclpy
+          from sensor_msgs.msg import JointState
+          from tf2_msgs.msg import TFMessage
+
+          master, slave = pty.openpty()
+          log = open('/tmp/lab2.log', 'w')
+          launch = subprocess.Popen([
+              'ros2', 'launch', 'mec356_arm', 'lab.launch.py', 'headless:=true',
+              'hardware:=true', 'port:=' + os.ttyname(slave)],
+              stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+          os.close(slave)
+          rviz_log = open('/tmp/rviz2.log', 'w')
+          rviz = subprocess.Popen(['rviz2', '-d', 'src/mec356_arm/config/arm.rviz',
+                                   '--ros-args', '-p', 'use_sim_time:=true'],
+                                  stdout=rviz_log, stderr=subprocess.STDOUT,
+                                  env={**os.environ, 'LIBGL_ALWAYS_SOFTWARE': '1'})
+          gazebo_gui = recorder = None
+          rclpy.init()
+          node = rclpy.create_node('lab2_smoke')
+          joints = {}
+          frames = set()
+          node.create_subscription(JointState, '/joint_states',
+              lambda msg: joints.update(zip(msg.name, msg.position)), 10)
+          node.create_subscription(TFMessage, '/tf',
+              lambda msg: frames.update((tf.header.frame_id, tf.child_frame_id)
+                                       for tf in msg.transforms), 10)
+          ids = ['joint1', 'joint2', 'joint3', 'joint4']
+          chain = {('base_link', 'L1'), ('L1', 'L2'), ('L2', 'L3'), ('L3', 'end_effector')}
+
+          def spin_until(check, seconds, label):
+              end = time.monotonic() + seconds
+              while not check():
+                  assert launch.poll() is None, 'Launch exited early'
+                  assert rviz.poll() is None, 'RViz exited early'
+                  assert time.monotonic() < end, (label, joints, frames)
+                  rclpy.spin_once(node, timeout_sec=0.1)
+
+          def command(angles, expected, gui=False):
+              if gui:
+                  script = '''
+          import runpy
+          import tkinter as tk
+          from tkinter import ttk
+          from rclpy.node import Node
+          real_tk = tk.Tk
+          create_publisher = Node.create_publisher
+          trajectory_publishers = []
+          def observe_publisher(self, msg_type, topic, *args, **kwargs):
+              publisher = create_publisher(self, msg_type, topic, *args, **kwargs)
+              if topic == '/arm_controller/joint_trajectory':
+                  trajectory_publishers.append(publisher)
+              return publisher
+          Node.create_publisher = observe_publisher
+          def instrumented_window():
+              window = real_tk()
+              def submit():
+                  if not trajectory_publishers or trajectory_publishers[0].get_subscription_count() < 2:
+                      window.after(100, submit)
+                      return
+                  panel = window.winfo_children()[0]
+                  sliders = [w for w in panel.winfo_children() if isinstance(w, tk.Scale)]
+                  for slider, value in zip(sliders, (0.30, 0.25, 0.15, 0.10, 2.0)):
+                      slider.set(value)
+                  next(w for w in panel.winfo_children()
+                       if isinstance(w, ttk.Button) and w.cget('text') == 'Send pose').invoke()
+                  window.after(900, window.destroy)
+              window.after(1500, submit)
+              return window
+          tk.Tk = instrumented_window
+          runpy.run_path('tools/arm_gui.py', run_name='__main__')
+          '''
+                  subprocess.run(['python3', '-c', script], check=True, timeout=15)
+              else:
+                  subprocess.run(['ros2', 'run', 'mec356_arm', 'send_pose',
+                                  *map(str, angles), '--seconds', '2', '--subscribers', '2'], check=True, timeout=15)
+              packet = b''
+              deadline = time.monotonic() + 5
+              while bytes([10]) not in packet and time.monotonic() < deadline:
+                  if select.select([master], [], [], 0.1)[0]:
+                      packet += os.read(master, 1024)
+              assert packet == expected.encode() + bytes([10]), packet
+              spin_until(lambda: all(abs(joints.get(j, 10) - a) < .035
+                                     for j, a in zip(ids, angles)), 15, 'Gazebo pose')
+              print(f'Passed: {angles}, serial {expected}, Gazebo {joints}', flush=True)
+
+          try:
+              spin_until(lambda: all(j in joints for j in ids) and chain <= frames, 80, 'TF chain')
+              controllers = subprocess.check_output(['ros2', 'control', 'list_controllers'],
+                                                    timeout=15, text=True)
+              for name in ('joint_state_broadcaster', 'arm_controller'):
+                  assert any(name in line and line.split()[-1] == 'active'
+                             for line in controllers.splitlines()), controllers
+              spin_until(lambda: b'RViz' in subprocess.check_output(
+                  ['xwininfo', '-root', '-tree'], timeout=5), 30, 'RViz window')
+              spin_until(lambda: 'OpenGl version' in Path('/tmp/rviz2.log').read_text(),
+                         30, 'RViz OpenGL initialization')
+              print('RViz window and software OpenGL initialized', flush=True)
+              software_gl = {**os.environ, 'LIBGL_ALWAYS_SOFTWARE': '1'}
+              gazebo_log = open('/tmp/gazebo-gui.log', 'w')
+              gazebo_gui = subprocess.Popen(['gz', 'sim', '-g'], env=software_gl,
+                                            stdout=gazebo_log, stderr=subprocess.STDOUT)
+              def window(name):
+                  result = subprocess.run(['xdotool', 'search', '--onlyvisible', '--name', name],
+                                          capture_output=True, text=True, timeout=5)
+                  return result.stdout.split()
+              spin_until(lambda: window('Gazebo Sim'), 40, 'Gazebo GUI window')
+              for name, x in [('Gazebo Sim', 0), ('RViz', 960)]:
+                  wid = window(name)[-1]
+                  subprocess.run(['xdotool', 'windowsize', wid, '960', '900',
+                                  'windowmove', wid, str(x), '0'], check=True, timeout=5)
+              time.sleep(4)
+              subprocess.run(['gz', 'service', '-s', '/gui/move_to/model',
+                              '--reqtype', 'gz.msgs.GUICamera', '--reptype', 'gz.msgs.Boolean',
+                              '-r', 'name: "mec356_arm"', '--timeout', '3000'], timeout=6)
+              time.sleep(2)
+              Path('demo').mkdir(exist_ok=True)
+              recorder = subprocess.Popen(['ffmpeg', '-loglevel', 'error', '-y', '-f', 'x11grab',
+                  '-framerate', '18', '-video_size', '1920x900', '-i', os.environ['DISPLAY'],
+                  '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+                  'demo/MEC356-Lab2-Gazebo-RViz.mp4'], stdin=subprocess.PIPE)
+              time.sleep(2)
+              command([0.55, 0.40, 0.25, -0.20], '122,113,2000')
+              command([-0.35, 0.25, 0.10, 0.15], '70,104,2000')
+              def still(name):
+                  subprocess.run(['ffmpeg', '-loglevel', 'error', '-y', '-f', 'x11grab',
+                      '-video_size', '1920x900', '-i', os.environ['DISPLAY'], '-frames:v', '1',
+                      f'demo/{name}.png'], check=True, timeout=12)
+              time.sleep(1)
+              still('before-GUI-command')
+              command([0.30, 0.25, 0.15, 0.10], '107,104,2000', gui=True)
+              time.sleep(1)
+              still('after-GUI-command')
+              command([0.0, 0.0, 0.0, 0.0], '90,90,2000')
+              time.sleep(2)
+          finally:
+              if recorder is not None:
+                  recorder.communicate(b'q\n', timeout=15)
+                  assert recorder.returncode == 0
+              if gazebo_gui is not None:
+                  gazebo_gui.terminate()
+                  print(Path('/tmp/gazebo-gui.log').read_text())
+              os.killpg(launch.pid, signal.SIGINT)
+              try:
+                  launch.wait(timeout=10)
+              except subprocess.TimeoutExpired:
+                  os.killpg(launch.pid, signal.SIGKILL)
+              rviz.terminate()
+              try:
+                  rviz.wait(timeout=5)
+              except subprocess.TimeoutExpired:
+                  rviz.kill()
+              rviz_log.close()
+              print(Path('/tmp/rviz2.log').read_text())
+              log.close()
+              print(open('/tmp/lab2.log').read())
+              os.close(master)
+              node.destroy_node()
+              rclpy.shutdown()
+          PY
+      - name: Upload rendered demo
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MEC356-Lab2-visual-demo
+          path: demo/
+          if-no-files-found: error
+  firmware:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Compile Arduino Nano firmware
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install arduino:avr
+          arduino-cli lib install Servo
+          arduino-cli compile --fqbn arduino:avr:nano firmware/arm_servos

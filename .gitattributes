@@ -1,0 +1,5 @@
+* text=auto
+*.py text eol=lf
+*.ino text eol=lf
+src/mec356_arm/scripts/* text eol=lf
+esp32/src/mec356_arm/scripts/* text eol=lf

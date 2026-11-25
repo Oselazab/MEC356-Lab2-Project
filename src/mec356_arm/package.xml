@@ -1,0 +1,23 @@
+<package format="3">
+  <name>mec356_arm</name><version>0.1.0</version>
+  <description>MEC356 Lab 2 robotic arm</description>
+  <maintainer email="maintainer@example.com">MEC356 Lab 2</maintainer>
+  <license>All rights reserved</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>trajectory_msgs</exec_depend>
+  <exec_depend>rosgraph_msgs</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>ros_gz_sim</exec_depend>
+  <exec_depend>ros_gz_bridge</exec_depend>
+  <exec_depend>gz_ros2_control</exec_depend>
+  <exec_depend>controller_manager</exec_depend>
+  <exec_depend>joint_state_broadcaster</exec_depend>
+  <exec_depend>joint_trajectory_controller</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>python3-serial</exec_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

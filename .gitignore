@@ -1,0 +1,7 @@
+/build/
+/install/
+/log/
+__pycache__/
+
+# Course handout retained in the local workspace
+docs/DoMS_Lab2_extracted.txt
